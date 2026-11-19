@@ -19,6 +19,8 @@ use Illuminate\Mail\Mailables\Envelope;
 use Illuminate\Mail\Mailables\Headers;
 use Illuminate\Queue\Middleware\RateLimited;
 use Illuminate\Queue\SerializesModels;
+use Symfony\Component\Mime\Address as SymfonyAddress;
+use Symfony\Component\Mime\Exception\RfcComplianceException;
 
 class GhostNewsletter extends Mailable implements ShouldQueue
 {
@@ -43,13 +45,18 @@ class GhostNewsletter extends Mailable implements ShouldQueue
     {
         $headers = $this->request?->headers ?? [];
 
+        // Symfony Mime 8 accepts Message-ID only as an IdentificationHeader.
+        // Laravel's text bag always becomes an UnstructuredHeader, which the
+        // queue worker rejects before the message reaches the transport.
+        // A missing or unusable value stays null so Symfony mints exactly one id.
         return new Headers(
+            messageId: $this->messageIdentifier($headers['message_id'] ?? null),
             text: collect($headers)
                 ->merge([
                     'x_newsletter_delivery_id' => (string) $this->deliveryId,
                 ])
-                ->reject(fn (string $value, string $key) => in_array($key, ['reply_to', 'sender'], true))
-                ->mapWithKeys(fn (string $value, string $key) => [$this->headerName($key) => $value])
+                ->reject(fn (string $value, string $key): bool => in_array($key, ['reply_to', 'sender', 'message_id'], true))
+                ->mapWithKeys(fn (string $value, string $key): array => [$this->headerName($key) => $value])
                 ->all(),
         );
     }
@@ -137,5 +144,81 @@ class GhostNewsletter extends Mailable implements ShouldQueue
             ->replace('_', '-')
             ->title()
             ->value();
+    }
+
+    /**
+     * Bare msg-id for Laravel's messageId argument, or null when Symfony should generate one.
+     *
+     * Ghost 6.78 sends `<%recipient.message_id%>`. After substitution that is one
+     * bracketed id. Repeated copies of that same id collapse to one header.
+     * Distinct, empty, unresolved, or CRLF-bearing values are not copied into
+     * the text bag: Message-ID is unique, and a raw newline would be header injection.
+     */
+    private function messageIdentifier(?string $value): ?string
+    {
+        if ($value === null || preg_match('/[\r\n\0]/', $value) === 1) {
+            return null;
+        }
+
+        $value = trim($value);
+
+        if ($value === '') {
+            return null;
+        }
+
+        if (preg_match('/^<\s*([^<>\s]+)\s*>$/D', $value, $matches) === 1) {
+            return $this->symfonyMessageIdentifier($matches[1]);
+        }
+
+        if (preg_match('/^[^<>\s,]+$/D', $value) === 1) {
+            return $this->symfonyMessageIdentifier($value);
+        }
+
+        $tokens = preg_split('/[\s,]+/', $value, -1, PREG_SPLIT_NO_EMPTY);
+
+        if ($tokens === false) {
+            return null;
+        }
+
+        $ids = [];
+
+        foreach ($tokens as $token) {
+            if (preg_match('/^<([^<>\s]+)>$/D', $token, $matches) === 1) {
+                $id = $matches[1];
+            } elseif (preg_match('/^[^<>\s]+$/D', $token) === 1) {
+                $id = $token;
+            } else {
+                return null;
+            }
+
+            $accepted = $this->symfonyMessageIdentifier($id);
+
+            if ($accepted === null) {
+                return null;
+            }
+
+            $ids[] = $accepted;
+        }
+
+        $ids = array_values(array_unique($ids));
+
+        return count($ids) === 1 ? $ids[0] : null;
+    }
+
+    private function symfonyMessageIdentifier(string $id): ?string
+    {
+        try {
+            $address = new SymfonyAddress($id);
+        } catch (RfcComplianceException) {
+            return null;
+        }
+
+        // IdentificationHeader renders the address unchanged only when Symfony
+        // accepts it as written. A rewritten id would no longer be Ghost's.
+        if ($address->getAddress() !== $id || $address->getEncodedAddress() !== $id) {
+            return null;
+        }
+
+        return $id;
     }
 }
